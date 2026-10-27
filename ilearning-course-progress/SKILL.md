@@ -5,7 +5,7 @@ description: "Use when 用户给出 ilearning.huawei.com 课程链接(applicatio
 
 # iLearning 课程进度补全（刷到达标）
 
-用 Playwright MCP 把华为 iLearning 课程的学习进度直接刷到 100%/达标，**无需真的看视频**。原理：课程进度服务端只认"块完成上报"接口，逐块 PUT 即可；章节小测走提交接口，正确答案就在块详情里。已在两门真实课程验证（2026-10：35 块+5 小测、8 块+1 小测，均一次刷到 100% 达标）。
+用 Playwright MCP 把华为 iLearning 课程的学习进度直接刷到 100%/达标，**无需真的看视频**。原理：课程进度服务端只认"块完成上报"接口，逐块 PUT 即可；章节小测走提交接口，正确答案就在块详情里。已在三门真实课程验证（2026-10：35 块+5 小测、8 块+1 小测、25 块+7 小测+考试+满意度问卷，均刷到 100% 达标）。
 
 ## 硬性约束
 
@@ -22,6 +22,7 @@ description: "Use when 用户给出 ilearning.huawei.com 课程链接(applicatio
 2. 拉大纲树 → 收集全部叶子块（blockType + blockId）
 3. 逐块 PUT forProgress 上报完成（video 用 definitions.duration，graphic/edm-document 用 1）
 4. 每个 quiz 块 POST quiz-student/answer 提交（正确答案从块详情 isRightFlag 提取）
+4b. satisfaction 块走问卷 API 提交；exam 考过后回来给 exam 块补 PUT
 5. 查进度接口验证 progress=100 & status=1，页面确认绿色"达标"印章
 ```
 
@@ -58,11 +59,12 @@ async (page) => {
     function walk(n) {
       if (!n) return;
       const t = n.blockType;
-      if (t === 'chapter' || t === 'sequential') { (n.children || []).forEach(walk); return; } // 容器，不上报
+      if (t === 'chapter' || t === 'sequential' || t === 'vertical' || t === 'course') { (n.children || []).forEach(walk); return; } // 容器，不上报
       if (t) out.push({ id: n.id || n.blockId, type: t });
       (n.children || []).forEach(walk);
     }
-    (j.data || []).forEach(walk);
+    // 大纲格式有两种：数组，或单个根对象(blockType 'course')——都要能走
+    if (Array.isArray(j.data)) j.data.forEach(walk); else walk(j.data);
     return out;
   });
   return JSON.stringify(blocks, null, 1);
@@ -72,8 +74,9 @@ async (page) => {
 **块类型判读**：
 - `video` / `graphic` / `edm-document` → 叶子内容块，逐个 PUT
 - `quiz` → 章节小测，走第 4 步提交
-- `exam` → 正式考试，交给 ilearning-exam skill
-- `chapter` / `sequential` → **容器，绝不 PUT**，只递归其 children（sequential 里常包着 quiz）
+- `exam` → 正式考试，交给 ilearning-exam skill；**考过之后还要回来给 exam 块补一次 forProgress PUT**（见第 3 步后说明），否则进度卡在 95% 不算完
+- `chapter` / `sequential` / `vertical` / `course` → **容器，绝不 PUT**，只递归其 children（sequential 里常包着 quiz；有的课程 vertical 在 sequential 与叶子之间）
+- `satisfaction` → 满意度问卷，走第 4b 步提交
 
 ## 第 3 步：批量上报块完成（核心）
 
@@ -104,6 +107,8 @@ async (page) => {
 ```
 
 规则：video → `duration = endTime = definitions.duration`；graphic / edm-document → `duration = endTime = 1`。全部返回 `OK` 才继续。
+
+**exam 块也要 PUT**：考试考过（ilearning-exam skill）后，进度若仍差一块（如 95%），给 exam 块补一次上报即可——body 同上，`blockType: 'exam'`，`duration = endTime = 1`。考试通过本身不会自动记录块进度。
 
 ## 第 4 步：提交章节小测（答案就在块详情里）
 
@@ -136,6 +141,42 @@ async (page) => {
 
 返回 `code=200 成功` 即提交完成（满分）。多个 quiz 块就循环调用。
 
+## 第 4b 步：提交满意度问卷（satisfaction 块）
+
+满意度块在课程页往往**渲染不出表单**（只有标题，无 iframe、无请求），直接走 API：
+
+```js
+async (page) => {
+  const result = await page.evaluate(async function() {
+    const APPLY = '<resourceApplyId>';
+    const BLOCK = '<satisfactionBlockId>';
+    // 1. 拿班级 sessionId（关键！不是 uuid/applyId）
+    const ir = await fetch('/sxz/api/student/v1/lms/course/application/intranet/<courseCode>?sessionCode=Self-paced&isPublished=false');
+    const sessionId = (await ir.json()).data.associationId;
+    // 2. 拿题目（questionnaireId 在块详情 definitions.questionnaireId）
+    const qr = await fetch('/sxz/api/student/api/student/course/satisfaction/questionsV2?questionnaireId=<questionnaireId>&associationId=<uuid>');
+    const questions = (await qr.json()).data || [];
+    // type '3' = 评分题（必答，selectKey 传数字 1-5）；type '2' = 开放文本（选答，可空）
+    const answers = questions.filter(function(q){ return q.type === '3'; }).map(function(q) {
+      return { questionId: q.id, selectKey: 5, answer: '', type: q.type, questionCategory: q.questionCategory };
+    });
+    // 3. 提交
+    const pr = await fetch('/sxz/api/student/api/student/course/satisfaction/commitAnswerV2', {
+      method: 'POST', headers: {'Content-Type':'application/json;charset=UTF-8'},
+      body: JSON.stringify({ sessionId: sessionId, questionnaireId: '<questionnaireId>',
+        questionnaireUserAnswers: answers, blockId: BLOCK, resourceApplyId: APPLY, roleType: '', roleCode: -1 })
+    });
+    const pj = await pr.json();
+    // 4. 验证
+    const vr = await fetch('/sxz/api/student/api/student/course/satisfaction/userAlreadyAnswer/' + sessionId);
+    return 'code=' + pj.code + ' answered=' + (await vr.json()).data;
+  });
+  return result;
+}
+```
+
+坑：`sessionId` 传 uuid/applyId/空串分别得到 403 `please_enroll_application` / 507 参数错误 / 507；传 `'Self-paced'` 得 400039（必须是数字）。真值只来自 intranet 接口的 `data.associationId`。
+
 ## 第 5 步：验证达标
 
 ```js
@@ -165,3 +206,7 @@ async (page) => {
 | quiz 提交 404/参数错 | `courseId` 用 curriculumId，`associationId` 用 courseResourceId(uuid)，`paperId` 用 `definitions.publishedPaperId` |
 | evaluate 回调只收 1 个参数 / 无 setTimeout / 箭头函数链报 SyntaxError | 包对象传参；用 `page.waitForTimeout`；evaluate 内一律 `function(){}` 风格 |
 | 课程页 hash 导航不生效 | SPA 路由，直接 `page.goto` 整个 URL，等待 3-4 秒让数据加载 |
+| 大纲接口返回单个根对象，`(j.data \|\| []).forEach` 报 not a function | 大纲有两种格式：数组或根对象（blockType `course`）；`Array.isArray(j.data)` 分支处理 |
+| 考试考过了进度卡在 95% | exam 块也要 PUT forProgress（duration=1）；考试通过不自动记块进度 |
+| satisfaction 块页面无表单可点 | 直接走 API：intranet 接口拿 sessionId → questionsV2 拿题 → commitAnswerV2 提交（见第 4b 步） |
+| commitAnswerV2 报 507/403/400039 | `sessionId` 必须是班级 session ID（intranet 接口 `data.associationId`），不是 uuid/applyId；`selectKey` 是数字分数 |
